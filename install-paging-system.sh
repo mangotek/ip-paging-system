@@ -1,5 +1,5 @@
 #!/bin/bash
-# Complete IP Paging System Installer for x86
+# Complete IP Paging System Installer for x86 with fixes
 # Tested on Ubuntu 22.04 (x86)
 
 # Configuration
@@ -56,8 +56,7 @@ chown -R $ADMIN_USER:$ADMIN_USER $INSTALL_DIR $DB_DIR $LOG_DIR
 echo "Installing dependencies..."
 apt install -y python3-pip python3-venv git sqlite3 nginx \
     gstreamer1.0-plugins-good gstreamer1.0-tools alsa-utils sox \
-    build-essential libssl-dev libffi-dev ufw asterisk espeak festival \
-    festival-dev festvox-kallpc16k
+    build-essential libssl-dev libffi-dev ufw asterisk espeak
 
 # Install Python dependencies
 echo "Setting up Python environment..."
@@ -65,57 +64,15 @@ python3 -m venv $INSTALL_DIR/venv
 source $INSTALL_DIR/venv/bin/activate
 pip install flask werkzeug configparser requests pyopenssl flask-sqlalchemy bcrypt
 
-# Create database
-echo "Initializing database..."
-cat > $INSTALL_DIR/init_db.py << 'EOL'
-import os
-import bcrypt
-from app import db, create_app
-from models import User, Zone, SIPConfig, AuditLog
-
-app = create_app()
-with app.app_context():
-    db.create_all()
-    
-    # Create default admin user if not exists
-    if not User.query.filter_by(username="admin").first():
-        admin = User(username="admin", password_hash=bcrypt.generate_password_hash("admin").decode('utf-8'))
-        db.session.add(admin)
-        db.session.commit()
-        print("Created default admin user")
-    
-    # Create default SIP config if not exists
-    if not SIPConfig.query.first():
-        sip_config = SIPConfig(
-            sip_user="paging",
-            sip_password="changeme",
-            sip_server="192.168.1.100",
-            sip_port=5060,
-            default_zone="Main Zone"
-        )
-        db.session.add(sip_config)
-        db.session.commit()
-        print("Created default SIP configuration")
-    
-    # Create test zone if none exist
-    if not Zone.query.first():
-        test_zone = Zone(name="Main Zone", description="Primary paging zone", sip_targets="1001,1002")
-        db.session.add(test_zone)
-        db.session.commit()
-        print("Created test paging zone")
-EOL
-
 # Create database models and app
 cat > $INSTALL_DIR/app.py << 'EOL'
 import os
 import logging
-import sqlite3
 import subprocess
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file
+from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_sqlalchemy import SQLAlchemy
 import bcrypt
-from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -220,7 +177,7 @@ allow=alaw
         
         extensions = f"""[page]
 exten => s,1,Answer()
-same => n,Playback({AUDIO_TEST_FILE})
+same => n,Playback(/opt/paging/static/test_message.wav)
 same => n,Hangup()
 """
         with open("/etc/asterisk/extensions.conf", "w") as f:
@@ -377,10 +334,10 @@ def test_audio():
     try:
         # Generate test message
         message = request.form.get('message', 'This is a test of the paging system')
-        subprocess.run(["text2wave", "-eval", "(voice_cmu_us_slt_arctic_hts)", "-o", AUDIO_TEST_FILE, message])
+        subprocess.run(["espeak", "-w", "/opt/paging/static/test_message.wav", message])
         
         # Play audio
-        subprocess.Popen(["aplay", AUDIO_TEST_FILE])
+        subprocess.Popen(["aplay", "/opt/paging/static/test_message.wav"])
         
         flash('Audio test completed', 'success')
         log_audit(session['user_id'], 'audio_test', message)
@@ -401,15 +358,107 @@ def audit_log():
     return render_template('audit_log.html', logs=logs)
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
     app.run(host='0.0.0.0', port=8080, debug=True)
 EOL
 
 # Create templates
 mkdir -p $INSTALL_DIR/templates
 
-# Login template remains the same as before...
+# Login template
+cat > $INSTALL_DIR/templates/login.html << 'EOL'
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Paging Control - Login</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f0f2f5;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .login-container {
+            background: white;
+            padding: 2rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            width: 300px;
+            text-align: center;
+        }
+        .logo {
+            font-size: 24px;
+            font-weight: bold;
+            color: #0a4f9e;
+            margin-bottom: 1.5rem;
+        }
+        .form-group {
+            margin-bottom: 1rem;
+            text-align: left;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: bold;
+        }
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 0.5rem;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        .btn {
+            background: #0a4f9e;
+            color: white;
+            border: none;
+            padding: 0.75rem;
+            border-radius: 4px;
+            width: 100%;
+            font-size: 1rem;
+            cursor: pointer;
+        }
+        .error {
+            color: #d9534f;
+            margin-bottom: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="logo">Paging Control</div>
+        
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit" class="btn">Sign In</button>
+        </form>
+        <div style="margin-top: 1rem; font-size: 0.8rem; color: #666;">
+            Default: admin/admin
+        </div>
+    </div>
+</body>
+</html>
+EOL
 
-# Dashboard template (updated with dynamic data)
+# Dashboard template
 cat > $INSTALL_DIR/templates/dashboard.html << 'EOL'
 <!DOCTYPE html>
 <html>
@@ -419,21 +468,126 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'EOL'
     <title>Paging Control - Dashboard</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        /* Existing styles remain the same... */
-        
-        /* New status indicators */
-        .status-active { color: #28a745; }
-        .status-inactive { color: #dc3545; }
-        .status-warning { color: #ffc107; }
-        
-        /* Quick action icons */
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            background-color: #f0f2f5;
+        }
+        .header {
+            background: #0a4f9e;
+            color: white;
+            padding: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+        .user-info {
+            display: flex;
+            align-items: center;
+        }
+        .username {
+            margin-right: 1rem;
+        }
+        .logout {
+            color: white;
+            text-decoration: none;
+        }
+        .container {
+            padding: 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .status-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            text-align: center;
+        }
+        .card-title {
+            font-size: 1.1rem;
+            font-weight: bold;
+            margin-bottom: 1rem;
+            color: #333;
+        }
+        .card-status {
+            font-size: 1.5rem;
+            font-weight: bold;
+            margin-bottom: 1rem;
+        }
+        .status-active {
+            color: #28a745;
+        }
+        .status-inactive {
+            color: #dc3545;
+        }
+        .status-warning {
+            color: #ffc107;
+        }
+        .card-content {
+            font-size: 0.9rem;
+            color: #666;
+        }
+        .card-footer {
+            margin-top: 1rem;
+        }
+        .btn {
+            background: #0a4f9e;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .quick-actions {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            margin-bottom: 2rem;
+        }
+        .section-title {
+            font-size: 1.25rem;
+            font-weight: bold;
+            margin-bottom: 1.5rem;
+            color: #333;
+        }
+        .action-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+        .action-item {
+            text-align: center;
+            padding: 1rem;
+            background: #f8f9fa;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        .action-item:hover {
+            background: #e9ecef;
+        }
         .action-icon {
             font-size: 2rem;
             margin-bottom: 0.5rem;
             color: #0a4f9e;
         }
-        
-        /* Zone list */
+        .action-label {
+            font-weight: bold;
+        }
         .zone-list {
             list-style: none;
             padding: 0;
@@ -584,8 +738,39 @@ cat > $INSTALL_DIR/templates/zones.html << 'EOL'
     <title>Paging Control - Zones</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        /* Header and container styles same as dashboard... */
-        
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            background-color: #f0f2f5;
+        }
+        .header {
+            background: #0a4f9e;
+            color: white;
+            padding: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+        .user-info {
+            display: flex;
+            align-items: center;
+        }
+        .username {
+            margin-right: 1rem;
+        }
+        .logout {
+            color: white;
+            text-decoration: none;
+        }
+        .container {
+            padding: 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
         .section-title {
             font-size: 1.5rem;
             margin-bottom: 1.5rem;
@@ -594,42 +779,34 @@ cat > $INSTALL_DIR/templates/zones.html << 'EOL'
             justify-content: space-between;
             align-items: center;
         }
-        
         .btn-success {
             background: #28a745;
         }
-        
         table {
             width: 100%;
             border-collapse: collapse;
             margin-bottom: 2rem;
         }
-        
         th, td {
             padding: 0.75rem;
             text-align: left;
             border-bottom: 1px solid #dee2e6;
         }
-        
         th {
             background-color: #f8f9fa;
             font-weight: bold;
         }
-        
         .actions-cell {
             display: flex;
             gap: 0.5rem;
         }
-        
         .btn-sm {
             padding: 0.25rem 0.5rem;
             font-size: 0.875rem;
         }
-        
         .btn-danger {
             background: #dc3545;
         }
-        
         .form-container {
             background: white;
             border-radius: 8px;
@@ -637,17 +814,14 @@ cat > $INSTALL_DIR/templates/zones.html << 'EOL'
             box-shadow: 0 4px 6px rgba(0,0,0,0.05);
             margin-bottom: 2rem;
         }
-        
         .form-group {
             margin-bottom: 1rem;
         }
-        
         label {
             display: block;
             margin-bottom: 0.5rem;
             font-weight: bold;
         }
-        
         input, textarea {
             width: 100%;
             padding: 0.5rem;
@@ -655,7 +829,6 @@ cat > $INSTALL_DIR/templates/zones.html << 'EOL'
             border-radius: 4px;
             box-sizing: border-box;
         }
-        
         .btn {
             background: #0a4f9e;
             color: white;
@@ -800,8 +973,39 @@ cat > $INSTALL_DIR/templates/settings.html << 'EOL'
     <title>Paging Control - Settings</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        /* Header and container styles same as dashboard... */
-        
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            background-color: #f0f2f5;
+        }
+        .header {
+            background: #0a4f9e;
+            color: white;
+            padding: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+        .user-info {
+            display: flex;
+            align-items: center;
+        }
+        .username {
+            margin-right: 1rem;
+        }
+        .logout {
+            color: white;
+            text-decoration: none;
+        }
+        .container {
+            padding: 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
         .settings-container {
             background: white;
             border-radius: 8px;
@@ -809,7 +1013,6 @@ cat > $INSTALL_DIR/templates/settings.html << 'EOL'
             box-shadow: 0 4px 6px rgba(0,0,0,0.05);
             margin-bottom: 2rem;
         }
-        
         .section-title {
             font-size: 1.5rem;
             margin-bottom: 1.5rem;
@@ -817,17 +1020,14 @@ cat > $INSTALL_DIR/templates/settings.html << 'EOL'
             border-bottom: 1px solid #eee;
             padding-bottom: 0.5rem;
         }
-        
         .form-group {
             margin-bottom: 1.5rem;
         }
-        
         label {
             display: block;
             margin-bottom: 0.5rem;
             font-weight: bold;
         }
-        
         input, select {
             width: 100%;
             padding: 0.75rem;
@@ -836,7 +1036,6 @@ cat > $INSTALL_DIR/templates/settings.html << 'EOL'
             box-sizing: border-box;
             font-size: 1rem;
         }
-        
         .status-indicator {
             display: inline-block;
             padding: 0.25rem 0.75rem;
@@ -845,11 +1044,9 @@ cat > $INSTALL_DIR/templates/settings.html << 'EOL'
             font-weight: bold;
             margin-left: 1rem;
         }
-        
         .status-active { background: #d4edda; color: #155724; }
         .status-inactive { background: #f8d7da; color: #721c24; }
         .status-warning { background: #fff3cd; color: #856404; }
-        
         .btn {
             background: #0a4f9e;
             color: white;
@@ -861,18 +1058,15 @@ cat > $INSTALL_DIR/templates/settings.html << 'EOL'
             text-decoration: none;
             display: inline-block;
         }
-        
         .btn-test {
             background: #17a2b8;
             margin-left: 1rem;
         }
-        
         .alert {
             padding: 1rem;
             margin-bottom: 1.5rem;
             border-radius: 4px;
         }
-        
         .alert-success { background: #d4edda; color: #155724; }
         .alert-danger { background: #f8d7da; color: #721c24; }
     </style>
@@ -961,14 +1155,44 @@ cat > $INSTALL_DIR/templates/audit_log.html << 'EOL'
     <title>Paging Control - Audit Log</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        /* Header and container styles same as dashboard... */
-        
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            background-color: #f0f2f5;
+        }
+        .header {
+            background: #0a4f9e;
+            color: white;
+            padding: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+        .user-info {
+            display: flex;
+            align-items: center;
+        }
+        .username {
+            margin-right: 1rem;
+        }
+        .logout {
+            color: white;
+            text-decoration: none;
+        }
+        .container {
+            padding: 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
         .section-title {
             font-size: 1.5rem;
             margin-bottom: 1.5rem;
             color: #333;
         }
-        
         .log-container {
             background: white;
             border-radius: 8px;
@@ -976,29 +1200,24 @@ cat > $INSTALL_DIR/templates/audit_log.html << 'EOL'
             box-shadow: 0 4px 6px rgba(0,0,0,0.05);
             margin-bottom: 2rem;
         }
-        
         table {
             width: 100%;
             border-collapse: collapse;
         }
-        
         th, td {
             padding: 0.75rem;
             text-align: left;
             border-bottom: 1px solid #dee2e6;
         }
-        
         th {
             background-color: #f8f9fa;
             font-weight: bold;
         }
-        
         .pagination {
             display: flex;
             justify-content: center;
             margin-top: 1.5rem;
         }
-        
         .pagination a, .pagination span {
             display: inline-block;
             padding: 0.5rem 0.75rem;
@@ -1008,7 +1227,6 @@ cat > $INSTALL_DIR/templates/audit_log.html << 'EOL'
             text-decoration: none;
             color: #0a4f9e;
         }
-        
         .pagination .active {
             background: #0a4f9e;
             color: white;
@@ -1160,14 +1378,26 @@ ufw allow 80/tcp
 ufw allow 5060/udp
 ufw --force enable
 
-# Initialize database
-echo "Setting up database..."
+# Create database
+echo "Initializing database..."
 cd $INSTALL_DIR
 source venv/bin/activate
-pip install flask-sqlalchemy
-python -c "from app import db; db.create_all()"
-python init_db.py
-deactivate
+flask db init || true
+flask db migrate -m "Initial migration" || true
+flask db upgrade || true
+
+# Create default admin user
+python -c "
+from app import app, db, User
+import bcrypt
+with app.app_context():
+    db.create_all()
+    if not User.query.filter_by(username='admin').first():
+        admin = User(username='admin', password_hash=bcrypt.generate_password_hash('admin').decode('utf-8'))
+        db.session.add(admin)
+        db.session.commit()
+        print('Created default admin user')
+"
 
 # Generate Asterisk configuration
 echo "Configuring Asterisk..."
@@ -1193,7 +1423,7 @@ EOL
 cat > /etc/asterisk/extensions.conf << EOL
 [page]
 exten => s,1,Answer()
-same => n,Playback($AUDIO_TEST_FILE)
+same => n,Playback(/opt/paging/static/test_message.wav)
 same => n,Hangup()
 EOL
 
@@ -1201,9 +1431,8 @@ chown -R $ADMIN_USER:$ADMIN_USER /etc/asterisk
 
 # Create test audio file
 echo "Creating test audio file..."
-echo "This is a test message for the paging system" | \
-    text2wave -eval '(voice_cmu_us_slt_arctic_hts)' -o $AUDIO_TEST_FILE || \
-    espeak -w $AUDIO_TEST_FILE "This is a test message for the paging system"
+mkdir -p $INSTALL_DIR/static
+espeak -w $AUDIO_TEST_FILE "This is a test message for the paging system"
 
 # Set permissions
 chown -R $ADMIN_USER:$ADMIN_USER $INSTALL_DIR $DB_DIR $LOG_DIR
@@ -1258,7 +1487,7 @@ echo -e "\n4. SIP registration status:"
 asterisk -rx "sip show registry" 2>/dev/null || echo "Asterisk command failed"
 
 echo -e "\n5. Database content:"
-sqlite3 $DB_FILE "SELECT * FROM user; SELECT * FROM sip_config; SELECT * FROM zone;" 2>/dev/null || echo "Database not found"
+sqlite3 $DB_FILE "SELECT * FROM user;" 2>/dev/null || echo "Database not found"
 
 echo -e "\nTroubleshooting tips:"
 echo "If you get a 502 Bad Gateway:"
