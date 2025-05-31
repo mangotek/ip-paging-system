@@ -8,6 +8,7 @@ INSTALL_DIR="/opt/paging"
 DB_DIR="/var/lib/paging"
 LOG_DIR="/var/log/paging"
 NGINX_DIR="/etc/nginx/sites-available"
+NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
 SERVICE_FILE="/etc/systemd/system/paging-web.service"
 AUDIO_TEST_FILE="$INSTALL_DIR/static/test_message.wav"
 DB_FILE="$DB_DIR/paging.db"
@@ -42,6 +43,7 @@ apt install -y net-tools curl
 echo "Creating directories..."
 mkdir -p $INSTALL_DIR $DB_DIR $LOG_DIR $INSTALL_DIR/static $INSTALL_DIR/templates
 chmod 755 $INSTALL_DIR $DB_DIR $LOG_DIR $INSTALL_DIR/static
+mkdir -p $NGINX_DIR $NGINX_ENABLED_DIR
 
 # Create system user
 if ! id "$ADMIN_USER" &>/dev/null; then
@@ -54,7 +56,8 @@ chown -R $ADMIN_USER:$ADMIN_USER $INSTALL_DIR $DB_DIR $LOG_DIR
 echo "Installing dependencies..."
 apt install -y python3-pip python3-venv git sqlite3 nginx \
     gstreamer1.0-plugins-good gstreamer1.0-tools alsa-utils sox \
-    build-essential libssl-dev libffi-dev ufw asterisk espeak bcrypt
+    build-essential libssl-dev libffi-dev ufw asterisk espeak festival \
+    festival-dev festvox-kallpc16k
 
 # Install Python dependencies
 echo "Setting up Python environment..."
@@ -65,6 +68,8 @@ pip install flask werkzeug configparser requests pyopenssl flask-sqlalchemy bcry
 # Create database
 echo "Initializing database..."
 cat > $INSTALL_DIR/init_db.py << 'EOL'
+import os
+import bcrypt
 from app import db, create_app
 from models import User, Zone, SIPConfig, AuditLog
 
@@ -372,7 +377,7 @@ def test_audio():
     try:
         # Generate test message
         message = request.form.get('message', 'This is a test of the paging system')
-        subprocess.run(["espeak", "-w", AUDIO_TEST_FILE, message])
+        subprocess.run(["text2wave", "-eval", "(voice_cmu_us_slt_arctic_hts)", "-o", AUDIO_TEST_FILE, message])
         
         # Play audio
         subprocess.Popen(["aplay", AUDIO_TEST_FILE])
@@ -1143,11 +1148,11 @@ EOL
 
 # Remove default site
 echo "Removing default Nginx site..."
-rm -f /etc/nginx/sites-enabled/default
+rm -f $NGINX_ENABLED_DIR/default
 
 # Enable configuration
 echo "Enabling Nginx site..."
-ln -sf $NGINX_DIR/paging /etc/nginx/sites-enabled/
+ln -sf $NGINX_DIR/paging $NGINX_ENABLED_DIR/paging
 
 # Configure firewall
 echo "Configuring firewall..."
@@ -1159,8 +1164,8 @@ ufw --force enable
 echo "Setting up database..."
 cd $INSTALL_DIR
 source venv/bin/activate
-export FLASK_APP=app.py
-flask db upgrade  # This would normally require migrations, but we're creating from scratch
+pip install flask-sqlalchemy
+python -c "from app import db; db.create_all()"
 python init_db.py
 deactivate
 
@@ -1197,7 +1202,8 @@ chown -R $ADMIN_USER:$ADMIN_USER /etc/asterisk
 # Create test audio file
 echo "Creating test audio file..."
 echo "This is a test message for the paging system" | \
-    text2wave -eval '(voice_cmu_us_slt_arctic_hts)' -o $AUDIO_TEST_FILE
+    text2wave -eval '(voice_cmu_us_slt_arctic_hts)' -o $AUDIO_TEST_FILE || \
+    espeak -w $AUDIO_TEST_FILE "This is a test message for the paging system"
 
 # Set permissions
 chown -R $ADMIN_USER:$ADMIN_USER $INSTALL_DIR $DB_DIR $LOG_DIR
@@ -1249,10 +1255,10 @@ echo -e "\n3. Asterisk status:"
 systemctl status asterisk --no-pager | head -10
 
 echo -e "\n4. SIP registration status:"
-asterisk -rx "sip show registry"
+asterisk -rx "sip show registry" 2>/dev/null || echo "Asterisk command failed"
 
 echo -e "\n5. Database content:"
-sqlite3 $DB_FILE "SELECT * FROM user; SELECT * FROM sip_config; SELECT * FROM zone;"
+sqlite3 $DB_FILE "SELECT * FROM user; SELECT * FROM sip_config; SELECT * FROM zone;" 2>/dev/null || echo "Database not found"
 
 echo -e "\nTroubleshooting tips:"
 echo "If you get a 502 Bad Gateway:"
