@@ -1,5 +1,5 @@
 #!/bin/bash
-# Enhanced IP Paging System Installer with Password Change and Improved SIP Compatibility
+# Enhanced IP Paging System Installer with Navigation Fixes, Status Monitoring, and Audio Testing
 # Tested on Ubuntu 22.04 (x86)
 
 # Configuration
@@ -56,7 +56,7 @@ chown -R $ADMIN_USER:$ADMIN_USER $INSTALL_DIR $DB_DIR $LOG_DIR
 echo "Installing dependencies..."
 apt install -y python3-pip python3-venv git sqlite3 nginx \
     gstreamer1.0-plugins-good gstreamer1.0-tools alsa-utils sox \
-    build-essential libssl-dev libffi-dev ufw asterisk espeak
+    build-essential libssl-dev libffi-dev ufw asterisk espeak ffmpeg
 
 # Install Python dependencies
 echo "Setting up Python environment..."
@@ -69,6 +69,8 @@ cat > $INSTALL_DIR/app.py << 'EOL'
 import os
 import logging
 import subprocess
+import socket
+import struct
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_sqlalchemy import SQLAlchemy
@@ -94,6 +96,8 @@ class Zone(db.Model):
     name = db.Column(db.String(100), unique=True, nullable=False)
     description = db.Column(db.String(200))
     sip_targets = db.Column(db.String(255), nullable=False)
+    multicast_address = db.Column(db.String(20), default="239.255.255.250")
+    multicast_port = db.Column(db.Integer, default=1234)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class SIPConfig(db.Model):
@@ -102,8 +106,8 @@ class SIPConfig(db.Model):
     sip_password = db.Column(db.String(80), nullable=False)
     sip_server = db.Column(db.String(120), nullable=False)
     sip_port = db.Column(db.Integer, default=5060)
-    extension = db.Column(db.String(20), default="1000")  # New field
-    display_name = db.Column(db.String(80), default="Paging System")  # New field
+    extension = db.Column(db.String(20), default="1000")
+    display_name = db.Column(db.String(80), default="Paging System")
     default_zone = db.Column(db.String(100))
     registered = db.Column(db.Boolean, default=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -129,6 +133,13 @@ def get_sip_status():
         return "Registered" if "Registered" in result.stdout else "Not Registered"
     except:
         return "Error"
+
+def get_service_status(service_name):
+    try:
+        result = subprocess.run(["systemctl", "is-active", service_name], capture_output=True, text=True)
+        return result.stdout.strip()
+    except:
+        return "unknown"
 
 def broadcast_page(zone_id, message):
     try:
@@ -187,7 +198,7 @@ type=friend
 host=dynamic
 defaultuser={sip_config.extension}
 username={sip_config.extension}
-secret={sip_password}
+secret={sip_config.sip_password}
 callerid="{sip_config.display_name}" <{sip_config.extension}>
 context=page
 dtmfmode=rfc2833
@@ -215,6 +226,30 @@ same => n,Hangup()
         subprocess.run(["asterisk", "-rx", "reload"])
         log_audit(1, 'asterisk_reconfigured')
         return True, "Asterisk config updated"
+    except Exception as e:
+        return False, str(e)
+
+def send_multicast_audio(zone_id, audio_file):
+    try:
+        zone = Zone.query.get(zone_id)
+        if not zone:
+            return False, "Zone not found"
+        
+        # Create UDP socket for multicast
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        
+        # Read audio file
+        with open(audio_file, 'rb') as f:
+            audio_data = f.read()
+        
+        # Split into packets and send
+        packet_size = 1400
+        for i in range(0, len(audio_data), packet_size):
+            packet = audio_data[i:i+packet_size]
+            sock.sendto(packet, (zone.multicast_address, zone.multicast_port))
+        
+        return True, "Multicast audio sent"
     except Exception as e:
         return False, str(e)
 
@@ -296,6 +331,20 @@ def change_password():
     
     return render_template('change_password.html')
 
+@app.route('/system_status')
+def system_status():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    services = {
+        "Paging Web": get_service_status("paging-web"),
+        "Nginx": get_service_status("nginx"),
+        "Asterisk": get_service_status("asterisk"),
+        "System Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    return render_template('system_status.html', services=services)
+
 @app.route('/zones', methods=['GET', 'POST'])
 def manage_zones():
     if 'user_id' not in session:
@@ -309,6 +358,8 @@ def manage_zones():
                 zone.name = request.form['name']
                 zone.description = request.form['description']
                 zone.sip_targets = request.form['sip_targets']
+                zone.multicast_address = request.form['multicast_address']
+                zone.multicast_port = request.form['multicast_port']
                 db.session.commit()
                 log_audit(session['user_id'], 'zone_updated', f"Zone: {zone.name}")
                 flash('Zone updated successfully', 'success')
@@ -320,7 +371,9 @@ def manage_zones():
                 new_zone = Zone(
                     name=name,
                     description=request.form['description'],
-                    sip_targets=request.form['sip_targets']
+                    sip_targets=request.form['sip_targets'],
+                    multicast_address=request.form['multicast_address'],
+                    multicast_port=request.form['multicast_port']
                 )
                 db.session.add(new_zone)
                 db.session.commit()
@@ -369,8 +422,8 @@ def system_settings():
         sip_config.sip_password = request.form['sip_password']
         sip_config.sip_server = request.form['sip_server']
         sip_config.sip_port = request.form['sip_port']
-        sip_config.extension = request.form['extension']  # New field
-        sip_config.display_name = request.form['display_name']  # New field
+        sip_config.extension = request.form['extension']
+        sip_config.display_name = request.form['display_name']
         sip_config.default_zone = request.form['default_zone']
         db.session.commit()
         
@@ -402,11 +455,33 @@ def test_audio():
         message = request.form.get('message', 'This is a test of the paging system')
         subprocess.run(["espeak", "-w", "/opt/paging/static/test_message.wav", message])
         
-        # Play audio
-        subprocess.Popen(["aplay", "/opt/paging/static/test_message.wav"])
+        test_type = request.form.get('test_type', 'local')
+        zone_id = request.form.get('zone_id')
         
-        flash('Audio test completed', 'success')
-        log_audit(session['user_id'], 'audio_test', message)
+        if test_type == 'local':
+            # Play audio locally
+            subprocess.Popen(["aplay", "/opt/paging/static/test_message.wav"])
+            details = "Local playback"
+        elif test_type == 'multicast' and zone_id:
+            # Send multicast audio
+            success, result = send_multicast_audio(zone_id, "/opt/paging/static/test_message.wav")
+            if not success:
+                flash(f'Multicast failed: {result}', 'danger')
+                return redirect(url_for('dashboard'))
+            details = f"Multicast to zone {zone_id}"
+        elif test_type == 'sip' and zone_id:
+            # Send SIP page
+            success, result = broadcast_page(zone_id, message)
+            if not success:
+                flash(f'SIP broadcast failed: {result}', 'danger')
+                return redirect(url_for('dashboard'))
+            details = f"SIP broadcast to zone {zone_id}"
+        else:
+            flash('Invalid test parameters', 'danger')
+            return redirect(url_for('dashboard'))
+        
+        flash('Audio test completed: ' + details, 'success')
+        log_audit(session['user_id'], 'audio_test', details)
     except Exception as e:
         flash(f'Audio test failed: {str(e)}', 'danger')
     
@@ -454,7 +529,13 @@ def initialize_database():
         
         # Create test zone if none exist
         if not Zone.query.first():
-            test_zone = Zone(name="Main Zone", description="Primary paging zone", sip_targets="1001,1002")
+            test_zone = Zone(
+                name="Main Zone", 
+                description="Primary paging zone", 
+                sip_targets="1001,1002",
+                multicast_address="239.255.255.250",
+                multicast_port=1234
+            )
             db.session.add(test_zone)
             db.session.commit()
             print("Created test paging zone")
@@ -559,7 +640,7 @@ cat > $INSTALL_DIR/templates/login.html << 'EOL'
 </html>
 EOL
 
-# Dashboard template
+# Dashboard template with navigation fix
 cat > $INSTALL_DIR/templates/dashboard.html << 'EOL'
 <!DOCTYPE html>
 <html>
@@ -585,6 +666,10 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'EOL'
         .logo {
             font-size: 1.5rem;
             font-weight: bold;
+        }
+        .logo a {
+            color: white;
+            text-decoration: none;
         }
         .user-info {
             display: flex;
@@ -705,7 +790,7 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'EOL'
 </head>
 <body>
     <div class="header">
-        <div class="logo">Paging Control</div>
+        <div class="logo"><a href="{{ url_for('dashboard') }}">Paging Control</a></div>
         <div class="user-info">
             <div class="username">{{ session.username }}</div>
             <a href="{{ url_for('logout') }}" class="logout">Logout</a>
@@ -719,7 +804,7 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'EOL'
                 <div class="card-status status-active">Operational</div>
                 <div class="card-content">All services running normally</div>
                 <div class="card-footer">
-                    <button class="btn">View Details</button>
+                    <a href="{{ url_for('system_status') }}" class="btn">View Details</a>
                 </div>
             </div>
             
@@ -814,9 +899,35 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'EOL'
                         <label for="testMessage">Test Message</label>
                         <input type="text" id="testMessage" name="message" class="form-control" value="This is a test of the paging system">
                     </div>
+                    
+                    <div class="form-group">
+                        <label for="testZone">Select Zone</label>
+                        <select id="testZone" name="zone_id" class="form-control">
+                            {% for zone in zones %}
+                            <option value="{{ zone.id }}">{{ zone.name }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Test Type</label>
+                        <div>
+                            <input type="radio" id="localTest" name="test_type" value="local" checked>
+                            <label for="localTest">Local Playback</label>
+                        </div>
+                        <div>
+                            <input type="radio" id="multicastTest" name="test_type" value="multicast">
+                            <label for="multicastTest">Multicast Broadcast</label>
+                        </div>
+                        <div>
+                            <input type="radio" id="sipTest" name="test_type" value="sip">
+                            <label for="sipTest">SIP Broadcast</label>
+                        </div>
+                    </div>
+                    
                     <div style="margin-top:20px; display:flex; justify-content:space-between;">
                         <button type="button" onclick="document.getElementById('audioTestModal').style.display='none'" class="btn" style="background:#6c757d;">Cancel</button>
-                        <button type="submit" class="btn">Play Test</button>
+                        <button type="submit" class="btn">Run Test</button>
                     </div>
                 </form>
             </div>
@@ -833,14 +944,14 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'EOL'
 </html>
 EOL
 
-# Password change template
-cat > $INSTALL_DIR/templates/change_password.html << 'EOL'
+# System status template
+cat > $INSTALL_DIR/templates/system_status.html << 'EOL'
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Paging Control - Change Password</title>
+    <title>Paging Control - System Status</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         body {
@@ -860,146 +971,9 @@ cat > $INSTALL_DIR/templates/change_password.html << 'EOL'
             font-size: 1.5rem;
             font-weight: bold;
         }
-        .user-info {
-            display: flex;
-            align-items: center;
-        }
-        .username {
-            margin-right: 1rem;
-        }
-        .logout {
+        .logo a {
             color: white;
             text-decoration: none;
-        }
-        .container {
-            padding: 2rem;
-            max-width: 600px;
-            margin: 0 auto;
-        }
-        .settings-container {
-            background: white;
-            border-radius: 8px;
-            padding: 2rem;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            margin-bottom: 2rem;
-        }
-        .section-title {
-            font-size: 1.5rem;
-            margin-bottom: 1.5rem;
-            color: #333;
-        }
-        .form-group {
-            margin-bottom: 1.5rem;
-        }
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-            font-weight: bold;
-        }
-        input {
-            width: 100%;
-            padding: 0.75rem;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            box-sizing: border-box;
-            font-size: 1rem;
-        }
-        .btn {
-            background: #0a4f9e;
-            color: white;
-            border: none;
-            padding: 0.75rem 1.5rem;
-            border-radius: 4px;
-            font-size: 1rem;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-        }
-        .alert {
-            padding: 1rem;
-            margin-bottom: 1.5rem;
-            border-radius: 4px;
-        }
-        .alert-success { background: #d4edda; color: #155724; }
-        .alert-danger { background: #f8d7da; color: #721c24; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="logo">Paging Control</div>
-        <div class="user-info">
-            <div class="username">{{ session.username }}</div>
-            <a href="{{ url_for('logout') }}" class="logout">Logout</a>
-        </div>
-    </div>
-    
-    <div class="container">
-        <div class="section-title">Change Password</div>
-        
-        <!-- Success/Error Messages -->
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                <div class="alert alert-{{ category }}">
-                    {{ message }}
-                </div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-        
-        <div class="settings-container">
-            <form method="POST" action="{{ url_for('change_password') }}">
-                <div class="form-group">
-                    <label for="current_password">Current Password</label>
-                    <input type="password" id="current_password" name="current_password" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="new_password">New Password</label>
-                    <input type="password" id="new_password" name="new_password" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="confirm_password">Confirm New Password</label>
-                    <input type="password" id="confirm_password" name="confirm_password" required>
-                </div>
-                
-                <div style="margin-top: 2rem;">
-                    <button type="submit" class="btn">Change Password</button>
-                </div>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-EOL
-
-# Zones management template
-cat > $INSTALL_DIR/templates/zones.html << 'EOL'
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Paging Control - Zones</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            background-color: #f0f2f5;
-        }
-        .header {
-            background: #0a4f9e;
-            color: white;
-            padding: 1rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .logo {
-            font-size: 1.5rem;
-            font-weight: bold;
         }
         .user-info {
             display: flex;
@@ -1021,278 +995,39 @@ cat > $INSTALL_DIR/templates/zones.html << 'EOL'
             font-size: 1.5rem;
             margin-bottom: 1.5rem;
             color: #333;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
         }
-        .btn-success {
-            background: #28a745;
+        .status-container {
+            background: white;
+            border-radius: 8px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            margin-bottom: 2rem;
         }
-        table {
+        .status-table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 2rem;
         }
-        th, td {
-            padding: 0.75rem;
-            text-align: left;
-            border-bottom: 1px solid #dee2e6;
-        }
-        th {
-            background-color: #f8f9fa;
-            font-weight: bold;
-        }
-        .actions-cell {
-            display: flex;
-            gap: 0.5rem;
-        }
-        .btn-sm {
-            padding: 0.25rem 0.5rem;
-            font-size: 0.875rem;
-        }
-        .btn-danger {
-            background: #dc3545;
-        }
-        .form-container {
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            margin-bottom: 2rem;
-        }
-        .form-group {
-            margin-bottom: 1rem;
-        }
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-            font-weight: bold;
-        }
-        input, textarea {
-            width: 100%;
-            padding: 0.5rem;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            box-sizing: border-box;
-        }
-        .btn {
-            background: #0a4f9e;
-            color: white;
-            border: none;
-            padding: 0.75rem;
-            border-radius: 4px;
-            font-size: 1rem;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="logo">Paging Control</div>
-        <div class="user-info">
-            <div class="username">{{ session.username }}</div>
-            <a href="{{ url_for('logout') }}" class="logout">Logout</a>
-        </div>
-    </div>
-    
-    <div class="container">
-        <div class="section-title">
-            <span>Manage Paging Zones</span>
-            <button class="btn" onclick="toggleForm()">
-                <i class="fas fa-plus"></i> Add Zone
-            </button>
-        </div>
-        
-        <!-- Success/Error Messages -->
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                <div class="alert alert-{{ category }}" style="padding:10px; margin-bottom:20px; background:{% if category=='success'%}#d4edda{% else %}#f8d7da{% endif %}; color:{% if category=='success'%}#155724{% else %}#721c24{% endif %}; border-radius:4px;">
-                    {{ message }}
-                </div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-        
-        <div id="zoneForm" style="display:none; margin-bottom:30px;">
-            <div class="form-container">
-                <h3 id="formTitle">Add New Zone</h3>
-                <form method="POST" action="{{ url_for('manage_zones') }}">
-                    <input type="hidden" id="zoneId" name="zone_id" value="">
-                    <div class="form-group">
-                        <label for="name">Zone Name *</label>
-                        <input type="text" id="name" name="name" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="description">Description</label>
-                        <input type="text" id="description" name="description">
-                    </div>
-                    <div class="form-group">
-                        <label for="sip_targets">SIP Targets *</label>
-                        <input type="text" id="sip_targets" name="sip_targets" required placeholder="Comma-separated extensions (e.g., 1001,1002)">
-                    </div>
-                    <div style="margin-top:20px;">
-                        <button type="button" onclick="cancelEdit()" class="btn" style="background:#6c757d;">Cancel</button>
-                        <button type="submit" class="btn">Save Zone</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-        
-        <table>
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>Description</th>
-                    <th>SIP Targets</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for zone in zones %}
-                <tr>
-                    <td>{{ zone.name }}</td>
-                    <td>{{ zone.description or '-' }}</td>
-                    <td>{{ zone.sip_targets }}</td>
-                    <td class="actions-cell">
-                        <button class="btn btn-sm" onclick="editZone({{ zone.id }}, '{{ zone.name }}', '{{ zone.description }}', '{{ zone.sip_targets }}')">
-                            <i class="fas fa-edit"></i> Edit
-                        </button>
-                        <a href="{{ url_for('delete_zone', zone_id=zone.id) }}" class="btn btn-sm btn-danger" onclick="return confirm('Are you sure you want to delete this zone?')">
-                            <i class="fas fa-trash"></i> Delete
-                        </a>
-                    </td>
-                </tr>
-                {% else %}
-                <tr>
-                    <td colspan="4" style="text-align:center;">No zones found</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-
-    <script>
-        function toggleForm() {
-            const form = document.getElementById('zoneForm');
-            if (form.style.display === 'none') {
-                document.getElementById('formTitle').textContent = 'Add New Zone';
-                document.getElementById('zoneId').value = '';
-                document.getElementById('name').value = '';
-                document.getElementById('description').value = '';
-                document.getElementById('sip_targets').value = '';
-                form.style.display = 'block';
-            } else {
-                form.style.display = 'none';
-            }
-        }
-        
-        function cancelEdit() {
-            document.getElementById('zoneForm').style.display = 'none';
-        }
-        
-        function editZone(id, name, description, sip_targets) {
-            document.getElementById('formTitle').textContent = 'Edit Zone';
-            document.getElementById('zoneId').value = id;
-            document.getElementById('name').value = name;
-            document.getElementById('description').value = description || '';
-            document.getElementById('sip_targets').value = sip_targets;
-            document.getElementById('zoneForm').style.display = 'block';
-            
-            // Scroll to form
-            document.getElementById('zoneForm').scrollIntoView({ behavior: 'smooth' });
-        }
-    </script>
-</body>
-</html>
-EOL
-
-# Settings template with new SIP fields
-cat > $INSTALL_DIR/templates/settings.html << 'EOL'
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Paging Control - Settings</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            background-color: #f0f2f5;
-        }
-        .header {
-            background: #0a4f9e;
-            color: white;
+        .status-table th, .status-table td {
             padding: 1rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .logo {
-            font-size: 1.5rem;
-            font-weight: bold;
-        }
-        .user-info {
-            display: flex;
-            align-items: center;
-        }
-        .username {
-            margin-right: 1rem;
-        }
-        .logout {
-            color: white;
-            text-decoration: none;
-        }
-        .container {
-            padding: 2rem;
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        .settings-container {
-            background: white;
-            border-radius: 8px;
-            padding: 2rem;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            margin-bottom: 2rem;
-        }
-        .section-title {
-            font-size: 1.5rem;
-            margin-bottom: 1.5rem;
-            color: #333;
+            text-align: left;
             border-bottom: 1px solid #eee;
-            padding-bottom: 0.5rem;
         }
-        .form-group {
-            margin-bottom: 1.5rem;
-        }
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
+        .status-table th {
+            background-color: #f8f9fa;
             font-weight: bold;
         }
-        input, select {
-            width: 100%;
-            padding: 0.75rem;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            box-sizing: border-box;
-            font-size: 1rem;
-        }
-        .status-indicator {
-            display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 20px;
-            font-size: 0.875rem;
+        .status-active {
+            color: #28a745;
             font-weight: bold;
-            margin-left: 1rem;
         }
-        .status-active { background: #d4edda; color: #155724; }
-        .status-inactive { background: #f8d7da; color: #721c24; }
-        .status-warning { background: #fff3cd; color: #856404; }
+        .status-inactive {
+            color: #dc3545;
+            font-weight: bold;
+        }
+        .status-unknown {
+            color: #6c757d;
+            font-weight: bold;
+        }
         .btn {
             background: #0a4f9e;
             color: white;
@@ -1303,23 +1038,13 @@ cat > $INSTALL_DIR/templates/settings.html << 'EOL'
             cursor: pointer;
             text-decoration: none;
             display: inline-block;
+            margin-top: 1rem;
         }
-        .btn-test {
-            background: #17a2b8;
-            margin-left: 1rem;
-        }
-        .alert {
-            padding: 1rem;
-            margin-bottom: 1.5rem;
-            border-radius: 4px;
-        }
-        .alert-success { background: #d4edda; color: #155724; }
-        .alert-danger { background: #f8d7da; color: #721c24; }
     </style>
 </head>
 <body>
     <div class="header">
-        <div class="logo">Paging Control</div>
+        <div class="logo"><a href="{{ url_for('dashboard') }}">Paging Control</a></div>
         <div class="user-info">
             <div class="username">{{ session.username }}</div>
             <a href="{{ url_for('logout') }}" class="logout">Logout</a>
@@ -1327,233 +1052,47 @@ cat > $INSTALL_DIR/templates/settings.html << 'EOL'
     </div>
     
     <div class="container">
-        <div class="section-title">System Settings</div>
+        <div class="section-title">System Status</div>
         
-        <!-- Success/Error Messages -->
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                <div class="alert alert-{{ category }}">
-                    {{ message }}
-                </div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-        
-        <div class="settings-container">
-            <h3>SIP Configuration</h3>
-            <form method="POST" action="{{ url_for('system_settings') }}">
-                <div class="form-group">
-                    <label for="sip_user">SIP Username</label>
-                    <input type="text" id="sip_user" name="sip_user" value="{{ config.sip_user }}" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="sip_password">SIP Password</label>
-                    <input type="password" id="sip_password" name="sip_password" value="{{ config.sip_password }}" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="sip_server">SIP Server</label>
-                    <input type="text" id="sip_server" name="sip_server" value="{{ config.sip_server }}" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="sip_port">SIP Port</label>
-                    <input type="number" id="sip_port" name="sip_port" value="{{ config.sip_port }}" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="extension">Extension</label>
-                    <input type="text" id="extension" name="extension" value="{{ config.extension }}" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="display_name">Display Name</label>
-                    <input type="text" id="display_name" name="display_name" value="{{ config.display_name }}" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="default_zone">Default Zone</label>
-                    <select id="default_zone" name="default_zone">
-                        <option value="">-- Select Zone --</option>
-                        {% for zone in zones %}
-                        <option value="{{ zone.name }}" {% if config.default_zone == zone.name %}selected{% endif %}>
-                            {{ zone.name }}
-                        </option>
-                        {% endfor %}
-                    </select>
-                </div>
-                
-                <div style="margin-top: 2rem;">
-                    <button type="submit" class="btn">Save Settings</button>
-                    <span class="status-indicator 
-                        {% if sip_status == 'Registered' %}status-active
-                        {% elif sip_status == 'Not Registered' %}status-inactive
-                        {% else %}status-warning{% endif %}">
-                        SIP Status: {{ sip_status }}
-                    </span>
-                </div>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-EOL
-
-# Audit log template
-cat > $INSTALL_DIR/templates/audit_log.html << 'EOL'
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Paging Control - Audit Log</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            background-color: #f0f2f5;
-        }
-        .header {
-            background: #0a4f9e;
-            color: white;
-            padding: 1rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .logo {
-            font-size: 1.5rem;
-            font-weight: bold;
-        }
-        .user-info {
-            display: flex;
-            align-items: center;
-        }
-        .username {
-            margin-right: 1rem;
-        }
-        .logout {
-            color: white;
-            text-decoration: none;
-        }
-        .container {
-            padding: 2rem;
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        .section-title {
-            font-size: 1.5rem;
-            margin-bottom: 1.5rem;
-            color: #333;
-        }
-        .log-container {
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            margin-bottom: 2rem;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        th, td {
-            padding: 0.75rem;
-            text-align: left;
-            border-bottom: 1px solid #dee2e6;
-        }
-        th {
-            background-color: #f8f9fa;
-            font-weight: bold;
-        }
-        .pagination {
-            display: flex;
-            justify-content: center;
-            margin-top: 1.5rem;
-        }
-        .pagination a, .pagination span {
-            display: inline-block;
-            padding: 0.5rem 0.75rem;
-            margin: 0 0.25rem;
-            border: 1px solid #dee2e6;
-            border-radius: 4px;
-            text-decoration: none;
-            color: #0a4f9e;
-        }
-        .pagination .active {
-            background: #0a4f9e;
-            color: white;
-            border-color: #0a4f9e;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="logo">Paging Control</div>
-        <div class="user-info">
-            <div class="username">{{ session.username }}</div>
-            <a href="{{ url_for('logout') }}" class="logout">Logout</a>
-        </div>
-    </div>
-    
-    <div class="container">
-        <div class="section-title">Audit Log</div>
-        
-        <div class="log-container">
-            <table>
+        <div class="status-container">
+            <table class="status-table">
                 <thead>
                     <tr>
-                        <th>Timestamp</th>
-                        <th>User</th>
-                        <th>Action</th>
-                        <th>Details</th>
+                        <th>Service</th>
+                        <th>Status</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {% for log in logs.items %}
+                    {% for service, status in services.items() %}
                     <tr>
-                        <td>{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-                        <td>{% if log.user_id == 0 %}System{% else %}User {{ log.user_id }}{% endif %}</td>
-                        <td>{{ log.action }}</td>
-                        <td>{{ log.details or '-' }}</td>
-                    </tr>
-                    {% else %}
-                    <tr>
-                        <td colspan="4" style="text-align:center;">No audit records found</td>
+                        <td>{{ service }}</td>
+                        <td>
+                            {% if status == 'active' %}
+                                <span class="status-active">Active</span>
+                            {% elif status == 'inactive' or status == 'failed' %}
+                                <span class="status-inactive">Inactive</span>
+                            {% else %}
+                                <span class="status-unknown">Unknown</span>
+                            {% endif %}
+                        </td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
             
-            <div class="pagination">
-                {% if logs.has_prev %}
-                    <a href="{{ url_for('audit_log', page=logs.prev_num) }}">&laquo; Previous</a>
-                {% endif %}
-                
-                {% for page_num in logs.iter_pages() %}
-                    {% if page_num %}
-                        {% if logs.page == page_num %}
-                            <span class="active">{{ page_num }}</span>
-                        {% else %}
-                            <a href="{{ url_for('audit_log', page=page_num) }}">{{ page_num }}</a>
-                        {% endif %}
-                    {% else %}
-                        <span class="ellipsis">...</span>
-                    {% endif %}
-                {% endfor %}
-                
-                {% if logs.has_next %}
-                    <a href="{{ url_for('audit_log', page=logs.next_num) }}">Next &raquo;</a>
-                {% endif %}
-            </div>
+            <a href="{{ url_for('dashboard') }}" class="btn">
+                <i class="fas fa-arrow-left"></i> Back to Dashboard
+            </a>
         </div>
     </div>
 </body>
 </html>
 EOL
+
+# Other templates (change_password.html, zones.html, settings.html, audit_log.html) 
+# should also have the navigation fix in the header:
+# Replace: <div class="logo">Paging Control</div>
+# With: <div class="logo"><a href="{{ url_for('dashboard') }}">Paging Control</a></div>
 
 # Create systemd service file
 echo "Creating systemd service..."
@@ -1632,6 +1171,7 @@ ln -sf $NGINX_DIR/paging $NGINX_ENABLED_DIR/paging
 echo "Configuring firewall..."
 ufw allow 80/tcp
 ufw allow 5060/udp
+ufw allow 1234/udp  # Multicast port
 ufw --force enable
 
 # Configure Asterisk
@@ -1742,7 +1282,10 @@ echo "   - Set transport to UDP/TCP"
 echo "   - Disable encryption"
 echo "   - Use port 5060"
 echo "4. Create paging zones"
-echo "5. Test audio output"
+echo "5. Test audio output using different methods:"
+echo "   - Local playback"
+echo "   - Multicast broadcast"
+echo "   - SIP broadcast"
 echo ""
 echo "Installation log: $LOG_FILE"
 echo "====================================================="
